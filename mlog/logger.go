@@ -21,10 +21,17 @@ package mlog
 
 import (
 	"fmt"
+	"time"
+
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"os"
 )
+
+// localTimeEncoder encodes time.Time to local timezone string
+func localTimeEncoder(t time.Time, enc zapcore.PrimitiveArrayEncoder) {
+	enc.AppendString(t.Local().Format("2006-01-02 15:04:05"))
+}
 
 type LogConfig struct {
 	// Level, See also zapcore.ParseLevel.
@@ -41,11 +48,22 @@ type LogConfig struct {
 var (
 	stderr = zapcore.Lock(os.Stderr)
 	lvl    = zap.NewAtomicLevelAt(zap.InfoLevel)
-	l      = zap.New(zapcore.NewCore(zapcore.NewConsoleEncoder(zap.NewDevelopmentEncoderConfig()), stderr, lvl))
-	s      = l.Sugar()
+	// Use local timezone for global logger
+	_globalEncoderConfig *zapcore.EncoderConfig
+	l      *zap.Logger
+	s      *zap.SugaredLogger
 
 	nop = zap.NewNop()
 )
+
+func init() {
+	// Use local timezone for global logger
+	cfg := zap.NewDevelopmentEncoderConfig()
+	cfg.EncodeTime = localTimeEncoder
+	_globalEncoderConfig = &cfg
+	l = zap.New(zapcore.NewCore(zapcore.NewConsoleEncoder(cfg), stderr, lvl))
+	s = l.Sugar()
+}
 
 func NewLogger(lc LogConfig) (*zap.Logger, error) {
 	lvl, err := zapcore.ParseLevel(lc.Level)
@@ -64,10 +82,17 @@ func NewLogger(lc LogConfig) (*zap.Logger, error) {
 		out = stderr
 	}
 
+	// Use local timezone for timestamps
+	productionConfig := zap.NewProductionEncoderConfig()
+	productionConfig.EncodeTime = localTimeEncoder
+
+	developmentConfig := zap.NewDevelopmentEncoderConfig()
+	developmentConfig.EncodeTime = localTimeEncoder
+
 	if lc.Production {
-		return zap.New(zapcore.NewCore(zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()), out, lvl)), nil
+		return zap.New(zapcore.NewCore(zapcore.NewJSONEncoder(productionConfig), out, lvl)), nil
 	}
-	return zap.New(zapcore.NewCore(zapcore.NewConsoleEncoder(zap.NewDevelopmentEncoderConfig()), out, lvl)), nil
+	return zap.New(zapcore.NewCore(zapcore.NewConsoleEncoder(developmentConfig), out, lvl)), nil
 }
 
 // L is a global logger.
