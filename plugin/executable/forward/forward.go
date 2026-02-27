@@ -51,9 +51,18 @@ const (
 	queryTimeout         = time.Second * 5
 )
 
+// Voting config for multi-upstream consensus
+type Voting struct {
+	Threshold int `yaml:"threshold"` // Minimum responses needed for consensus
+	Timeout   int `yaml:"timeout"`   // Wait timeout in milliseconds
+}
+
 type Args struct {
 	Upstreams  []UpstreamConfig `yaml:"upstreams"`
 	Concurrent int              `yaml:"concurrent"`
+
+	// Voting consensus configuration
+	Voting *Voting `yaml:"voting"`
 
 	// Global options.
 	Socks5       string `yaml:"socks5"`
@@ -245,6 +254,17 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 	}
 	defer pool.ReleaseBuf(queryPayload)
 
+	// If voting is not enabled, use original logic
+	if f.args.Voting == nil || f.args.Voting.Threshold <= 0 {
+		return f.exchangeOriginal(ctx, qCtx, us, queryPayload)
+	}
+
+	// Voting mode: collect multiple responses and vote
+	return f.exchangeWithVoting(ctx, qCtx, us, queryPayload)
+}
+
+// Original exchange logic (non-voting)
+func (f *Forward) exchangeOriginal(ctx context.Context, qCtx *query_context.Context, us []*upstreamWrapper, queryPayload *[]byte) (*dns.Msg, error) {
 	concurrent := f.args.Concurrent
 	if concurrent <= 0 {
 		concurrent = 1
@@ -268,7 +288,6 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 		qc := copyPayload(queryPayload)
 		go func(uqid uint32, question dns.Question) {
 			defer pool.ReleaseBuf(qc)
-			// Give each upstream a fixed timeout to finish the query.
 			upstreamCtx, cancel := context.WithTimeout(context.Background(), queryTimeout)
 			defer cancel()
 
@@ -306,8 +325,6 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 			if err != nil {
 				continue
 			}
-
-			// Retry until the last
 			if i < concurrent-1 && r.Rcode != dns.RcodeSuccess && r.Rcode != dns.RcodeNameError {
 				continue
 			}
@@ -317,6 +334,126 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 		}
 	}
 	return nil, errors.New("all upstream servers failed")
+}
+
+// Voting response type (extend original res with timing)
+// Exchange with voting consensus
+func (f *Forward) exchangeWithVoting(ctx context.Context, qCtx *query_context.Context, us []*upstreamWrapper, queryPayload *[]byte) (*dns.Msg, error) {
+	type res struct {
+		r   *dns.Msg
+		err error
+	}
+	threshold := f.args.Voting.Threshold
+	votingTimeout := time.Duration(f.args.Voting.Timeout) * time.Millisecond
+	if votingTimeout <= 0 {
+		votingTimeout = queryTimeout
+	}
+
+	// Initial concurrent requests
+	concurrent := f.args.Concurrent
+	if concurrent <= 0 {
+		concurrent = 1
+	}
+	if concurrent > maxConcurrentQueries {
+		concurrent = maxConcurrentQueries
+	}
+	if threshold > len(us) {
+		threshold = len(us)
+	}
+
+	resChan := make(chan res, len(us))
+	done := make(chan struct{})
+	defer close(done)
+
+	sendRequest := func(u *upstreamWrapper) {
+		qc := copyPayload(queryPayload)
+		go func(uqid uint32, question dns.Question) {
+			defer pool.ReleaseBuf(qc)
+			upstreamCtx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+			defer cancel()
+
+			var r *dns.Msg
+			respPayload, err := u.ExchangeContext(upstreamCtx, *qc)
+			if err != nil {
+				f.logger.Warn(
+					"upstream error",
+					zap.Uint32("uqid", uqid),
+					zap.String("qname", question.Name),
+					zap.Uint16("qclass", question.Qclass),
+					zap.Uint16("qtype", question.Qtype),
+					zap.String("upstream", u.name()),
+					zap.Error(err),
+				)
+			} else {
+				r = new(dns.Msg)
+				err = r.Unpack(*respPayload)
+				pool.ReleaseBuf(respPayload)
+				if err != nil {
+					r = nil
+				}
+			}
+			select {
+			case resChan <- res{r: r, err: err}:
+			case <-done:
+			}
+		}(qCtx.Id(), qCtx.QQuestion())
+	}
+
+	// Send initial concurrent requests
+	r := rand.IntN(len(us))
+	sent := 0
+	for i := 0; i < concurrent && sent < len(us); i++ {
+		sendRequest(us[(r+i)%len(us)])
+		sent++
+	}
+
+	// Voting: use map to count IPs incrementally
+	ipCounts := make(map[string]int)
+	ipResponse := make(map[string]*dns.Msg)
+	var responses []res
+	timeoutCtx, cancel := context.WithTimeout(ctx, votingTimeout)
+	defer cancel()
+
+	// Collect responses
+	for {
+		select {
+		case res := <-resChan:
+			if res.err == nil && res.r != nil {
+				responses = append(responses, res)
+				// Increment IP counts from this response
+				if res.r.Answer != nil {
+					for _, ans := range res.r.Answer {
+						if a, ok := ans.(*dns.A); ok {
+							ip := a.A.String()
+							ipCounts[ip]++
+							if ipCounts[ip] == 1 {
+								ipResponse[ip] = res.r
+							}
+							// Check if threshold reached
+							if ipCounts[ip] >= threshold {
+								return res.r, nil
+							}
+						}
+					}
+				}
+			}
+			// Send more requests if available
+			if sent < len(us) {
+				sendRequest(us[(r+sent)%len(us)])
+				sent++
+			}
+		case <-timeoutCtx.Done():
+			// Timeout, return first successful response
+			for _, r := range responses {
+				if r.r != nil {
+					return r.r, nil
+				}
+			}
+			return nil, errors.New("all upstream servers failed")
+		case <-ctx.Done():
+			return nil, context.Cause(ctx)
+		}
+	}
 }
 
 func quickSetup(bq sequence.BQ, s string) (any, error) {
