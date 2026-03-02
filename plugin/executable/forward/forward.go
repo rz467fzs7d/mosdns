@@ -340,8 +340,9 @@ func (f *Forward) exchangeOriginal(ctx context.Context, qCtx *query_context.Cont
 // Exchange with voting consensus
 func (f *Forward) exchangeWithVoting(ctx context.Context, qCtx *query_context.Context, us []*upstreamWrapper, queryPayload *[]byte) (*dns.Msg, error) {
 	type res struct {
-		r   *dns.Msg
-		err error
+		r      *dns.Msg
+		err    error
+		origin string // upstream name for logging
 	}
 	threshold := f.args.Voting.Threshold
 	votingTimeout := time.Duration(f.args.Voting.Timeout) * time.Millisecond
@@ -367,7 +368,7 @@ func (f *Forward) exchangeWithVoting(ctx context.Context, qCtx *query_context.Co
 
 	sendRequest := func(u *upstreamWrapper) {
 		qc := copyPayload(queryPayload)
-		go func(uqid uint32, question dns.Question) {
+		go func(uqid uint32, question dns.Question, upstreamName string) {
 			defer pool.ReleaseBuf(qc)
 			upstreamCtx, cancel := context.WithTimeout(context.Background(), queryTimeout)
 			defer cancel()
@@ -381,7 +382,7 @@ func (f *Forward) exchangeWithVoting(ctx context.Context, qCtx *query_context.Co
 					zap.String("qname", question.Name),
 					zap.Uint16("qclass", question.Qclass),
 					zap.Uint16("qtype", question.Qtype),
-					zap.String("upstream", u.name()),
+					zap.String("upstream", upstreamName),
 					zap.Error(err),
 				)
 			} else {
@@ -393,10 +394,10 @@ func (f *Forward) exchangeWithVoting(ctx context.Context, qCtx *query_context.Co
 				}
 			}
 			select {
-			case resChan <- res{r: r, err: err}:
+			case resChan <- res{r: r, err: err, origin: upstreamName}:
 			case <-done:
 			}
-		}(qCtx.Id(), qCtx.QQuestion())
+		}(qCtx.Id(), qCtx.QQuestion(), u.name())
 	}
 
 	// Send initial concurrent requests
@@ -420,22 +421,42 @@ func (f *Forward) exchangeWithVoting(ctx context.Context, qCtx *query_context.Co
 		case res := <-resChan:
 			if res.err == nil && res.r != nil {
 				responses = append(responses, res)
-				// Increment IP counts from this response
+				// Debug: log received response
+				var ips []string
 				if res.r.Answer != nil {
-					for _, ans := range res.r.Answer {
+					// Only compare the first IP for consensus (simpler and more effective)
+					for i, ans := range res.r.Answer {
 						if a, ok := ans.(*dns.A); ok {
 							ip := a.A.String()
-							ipCounts[ip]++
-							if ipCounts[ip] == 1 {
-								ipResponse[ip] = res.r
-							}
-							// Check if threshold reached
-							if ipCounts[ip] >= threshold {
-								return res.r, nil
+							ips = append(ips, ip)
+							// Only count the first IP for voting
+							if i == 0 {
+								ipCounts[ip]++
+								if ipCounts[ip] == 1 {
+									ipResponse[ip] = res.r
+								}
+								// Check if threshold reached
+								if ipCounts[ip] >= threshold {
+									f.logger.Debug("voting consensus reached",
+										zap.String("qname", qCtx.QQuestion().Name),
+										zap.String("upstream", res.origin),
+										zap.String("ip", ip),
+										zap.Int("count", ipCounts[ip]),
+										zap.Int("threshold", threshold),
+									)
+									return res.r, nil
+								}
 							}
 						}
 					}
 				}
+				f.logger.Debug("voting received response",
+					zap.String("qname", qCtx.QQuestion().Name),
+					zap.String("upstream", res.origin),
+					zap.Strings("ips", ips),
+					zap.Any("ip_counts", ipCounts),
+					zap.Int("threshold", threshold),
+				)
 			}
 			// Send more requests if available
 			if sent < len(us) {
